@@ -13,7 +13,6 @@ window_json=$(hyprctl activewindow -j)
 window_addr=$(echo "$window_json" | jq -r '.address')
 window_x=$(echo "$window_json" | jq -r '.at[0]')
 window_y=$(echo "$window_json" | jq -r '.at[1]')
-current_workspace=$(echo "$window_json" | jq -r '.workspace.id')
 current_monitor_id=$(echo "$window_json" | jq -r '.monitor')
 
 if [[ "$window_addr" == "null" || -z "$window_addr" ]]; then
@@ -21,32 +20,99 @@ if [[ "$window_addr" == "null" || -z "$window_addr" ]]; then
     exit 1
 fi
 
-clients_json=$(hyprctl clients -j)
+# Try swapwindow first - let Hyprland decide if there's an adjacent window
+hyprctl dispatch swapwindow "$direction"
+sleep 0.05
 
-# Check if there's a window in the target direction on the same workspace
-case "$direction" in
-    l) other_window=$(echo "$clients_json" | jq -r "[.[] | select(.workspace.id == $current_workspace and .address != \"$window_addr\" and .at[0] < $window_x)] | sort_by(.at[0]) | last | .address") ;;
-    r) other_window=$(echo "$clients_json" | jq -r "[.[] | select(.workspace.id == $current_workspace and .address != \"$window_addr\" and .at[0] > $window_x)] | sort_by(.at[0]) | first | .address") ;;
-    u) other_window=$(echo "$clients_json" | jq -r "[.[] | select(.workspace.id == $current_workspace and .address != \"$window_addr\" and .at[1] < $window_y)] | sort_by(.at[1]) | last | .address") ;;
-    d) other_window=$(echo "$clients_json" | jq -r "[.[] | select(.workspace.id == $current_workspace and .address != \"$window_addr\" and .at[1] > $window_y)] | sort_by(.at[1]) | first | .address") ;;
-esac
+# Check if the window actually moved
+window_json_after=$(hyprctl activewindow -j)
+window_x_after=$(echo "$window_json_after" | jq -r '.at[0]')
+window_y_after=$(echo "$window_json_after" | jq -r '.at[1]')
 
-# If there's a window in that direction, swap with it
-if [[ -n "$other_window" && "$other_window" != "null" ]]; then
-    hyprctl dispatch swapwindow "$direction"
+# If position changed, swap happened within workspace - done
+if [[ "$window_x" != "$window_x_after" || "$window_y" != "$window_y_after" ]]; then
     exit 0
 fi
 
-# No window in that direction - move to adjacent monitor
+# Position didn't change - window is at the edge, find adjacent monitor.
+#
+# Detection is direction-aware with axis-overlap:
+#   l/r → target must overlap on the Y axis (share a horizontal band)
+#   u/d → target must overlap on the X axis (share a vertical band)
+#
+# This prevents e.g. pressing "d" from a tall left monitor from jumping
+# to a shorter right monitor that starts lower on the Y axis.
+
 monitors_json=$(hyprctl monitors -j)
-current_mon_x=$(echo "$monitors_json" | jq -r ".[] | select(.id == $current_monitor_id) | .x")
-current_mon_y=$(echo "$monitors_json" | jq -r ".[] | select(.id == $current_monitor_id) | .y")
+
+# Compute current monitor's actual bounds (swap w/h for 90°/270° rotation)
+cm=$(echo "$monitors_json" | jq ".[] | select(.id == $current_monitor_id)")
+cm_x=$(echo "$cm" | jq -r '.x')
+cm_y=$(echo "$cm" | jq -r '.y')
+cm_w=$(echo "$cm" | jq -r '.width')
+cm_h=$(echo "$cm" | jq -r '.height')
+cm_t=$(echo "$cm" | jq -r '.transform')
+
+if [[ "$cm_t" == "1" || "$cm_t" == "3" ]]; then
+    tmp=$cm_w; cm_w=$cm_h; cm_h=$tmp
+fi
+
+cm_x2=$((cm_x + cm_w))   # right edge
+cm_y2=$((cm_y + cm_h))   # bottom edge
+
+# For each candidate monitor, actual width/height accounts for rotation.
+# jq expression: (if transform 1|3 then swap w/h else keep end)
+dim='(if (.transform == 1 or .transform == 3) then {w: .height, h: .width} else {w: .width, h: .height} end)'
 
 case "$direction" in
-    l) target_monitor=$(echo "$monitors_json" | jq -r "[.[] | select(.x < $current_mon_x)] | sort_by(.x) | last | .name") ;;
-    r) target_monitor=$(echo "$monitors_json" | jq -r "[.[] | select(.x > $current_mon_x)] | sort_by(.x) | first | .name") ;;
-    u) target_monitor=$(echo "$monitors_json" | jq -r "[.[] | select(.y < $current_mon_y)] | sort_by(.y) | last | .name") ;;
-    d) target_monitor=$(echo "$monitors_json" | jq -r "[.[] | select(.y > $current_mon_y)] | sort_by(.y) | first | .name") ;;
+    r)
+        target_monitor=$(echo "$monitors_json" | jq -r \
+            --argjson cur "$current_monitor_id" \
+            --argjson cx2 "$cm_x2" \
+            --argjson cy  "$cm_y"  \
+            --argjson cy2 "$cm_y2" \
+            "[.[] | . as \$m | $dim as \$d | select(
+                \$m.id != \$cur and
+                \$m.x >= \$cx2 and
+                \$m.y < \$cy2 and (\$m.y + \$d.h) > \$cy
+            )] | sort_by(.x) | first | .name")
+        ;;
+    l)
+        target_monitor=$(echo "$monitors_json" | jq -r \
+            --argjson cur "$current_monitor_id" \
+            --argjson cx  "$cm_x"  \
+            --argjson cy  "$cm_y"  \
+            --argjson cy2 "$cm_y2" \
+            "[.[] | . as \$m | $dim as \$d | select(
+                \$m.id != \$cur and
+                (\$m.x + \$d.w) <= \$cx and
+                \$m.y < \$cy2 and (\$m.y + \$d.h) > \$cy
+            )] | sort_by(.x) | last | .name")
+        ;;
+    d)
+        target_monitor=$(echo "$monitors_json" | jq -r \
+            --argjson cur "$current_monitor_id" \
+            --argjson cx  "$cm_x"  \
+            --argjson cx2 "$cm_x2" \
+            --argjson cy2 "$cm_y2" \
+            "[.[] | . as \$m | $dim as \$d | select(
+                \$m.id != \$cur and
+                \$m.y >= \$cy2 and
+                \$m.x < \$cx2 and (\$m.x + \$d.w) > \$cx
+            )] | sort_by(.y) | first | .name")
+        ;;
+    u)
+        target_monitor=$(echo "$monitors_json" | jq -r \
+            --argjson cur "$current_monitor_id" \
+            --argjson cx  "$cm_x"  \
+            --argjson cx2 "$cm_x2" \
+            --argjson cy  "$cm_y"  \
+            "[.[] | . as \$m | $dim as \$d | select(
+                \$m.id != \$cur and
+                (\$m.y + \$d.h) <= \$cy and
+                \$m.x < \$cx2 and (\$m.x + \$d.w) > \$cx
+            )] | sort_by(.y) | last | .name")
+        ;;
 esac
 
 if [[ "$target_monitor" == "null" || -z "$target_monitor" ]]; then
@@ -58,8 +124,7 @@ target_workspace=$(echo "$monitors_json" | jq -r ".[] | select(.name == \"$targe
 hyprctl dispatch movetoworkspace "$target_workspace"
 
 # Position window on the edge closest to where it came from.
-# The window lands at the end of the tiling layout after movetoworkspace,
-# so swap exactly (number of other windows) times to reach the correct edge.
+# Swap exactly (number of other windows on target) times to reach the correct edge.
 moved_addr=$(hyprctl activewindow -j | jq -r '.address')
 other_count=$(hyprctl clients -j | jq "[.[] | select(.workspace.id == $target_workspace and .address != \"$moved_addr\")] | length")
 
