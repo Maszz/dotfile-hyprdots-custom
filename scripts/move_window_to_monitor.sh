@@ -20,28 +20,27 @@ if [[ "$window_addr" == "null" || -z "$window_addr" ]]; then
     exit 1
 fi
 
-# Try swapwindow first - let Hyprland decide if there's an adjacent window
 hyprctl dispatch swapwindow "$direction"
-sleep 0.05
 
-# Check if the window actually moved
 window_json_after=$(hyprctl activewindow -j)
 window_x_after=$(echo "$window_json_after" | jq -r '.at[0]')
 window_y_after=$(echo "$window_json_after" | jq -r '.at[1]')
+monitor_after=$(echo "$window_json_after" | jq -r '.monitor')
 
-# If position changed, swap happened within workspace - done
+# If position changed but stayed on same monitor, swap happened within workspace - done
 if [[ "$window_x" != "$window_x_after" || "$window_y" != "$window_y_after" ]]; then
-    exit 0
+    if [[ "$monitor_after" == "$current_monitor_id" ]]; then
+        exit 0
+    fi
+    # swapwindow crossed a monitor - undo it, then fall through to movetoworkspace
+    case "$direction" in
+        r) hyprctl dispatch swapwindow l ;;
+        l) hyprctl dispatch swapwindow r ;;
+        d) hyprctl dispatch swapwindow u ;;
+        u) hyprctl dispatch swapwindow d ;;
+    esac
 fi
 
-# Position didn't change - window is at the edge, find adjacent monitor.
-#
-# Detection is direction-aware with axis-overlap:
-#   l/r → target must overlap on the Y axis (share a horizontal band)
-#   u/d → target must overlap on the X axis (share a vertical band)
-#
-# This prevents e.g. pressing "d" from a tall left monitor from jumping
-# to a shorter right monitor that starts lower on the Y axis.
 
 monitors_json=$(hyprctl monitors -j)
 
@@ -60,8 +59,6 @@ fi
 cm_x2=$((cm_x + cm_w))   # right edge
 cm_y2=$((cm_y + cm_h))   # bottom edge
 
-# For each candidate monitor, actual width/height accounts for rotation.
-# jq expression: (if transform 1|3 then swap w/h else keep end)
 dim='(if (.transform == 1 or .transform == 3) then {w: .height, h: .width} else {w: .width, h: .height} end)'
 
 case "$direction" in
@@ -122,15 +119,3 @@ fi
 # Move window to active workspace on target monitor (with focus)
 target_workspace=$(echo "$monitors_json" | jq -r ".[] | select(.name == \"$target_monitor\") | .activeWorkspace.id")
 hyprctl dispatch movetoworkspace "$target_workspace"
-
-# Position window on the edge closest to where it came from.
-# Swap exactly (number of other windows on target) times to reach the correct edge.
-moved_addr=$(hyprctl activewindow -j | jq -r '.address')
-other_count=$(hyprctl clients -j | jq "[.[] | select(.workspace.id == $target_workspace and .address != \"$moved_addr\")] | length")
-
-case "$direction" in
-    r) for i in $(seq 1 "$other_count"); do hyprctl dispatch swapwindow l; done ;;
-    l) for i in $(seq 1 "$other_count"); do hyprctl dispatch swapwindow r; done ;;
-    d) for i in $(seq 1 "$other_count"); do hyprctl dispatch swapwindow u; done ;;
-    u) for i in $(seq 1 "$other_count"); do hyprctl dispatch swapwindow d; done ;;
-esac
