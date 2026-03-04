@@ -13,35 +13,37 @@ window_json=$(hyprctl activewindow -j)
 window_addr=$(echo "$window_json" | jq -r '.address')
 window_x=$(echo "$window_json" | jq -r '.at[0]')
 window_y=$(echo "$window_json" | jq -r '.at[1]')
+window_w=$(echo "$window_json" | jq -r '.size[0]')
+window_h=$(echo "$window_json" | jq -r '.size[1]')
 current_monitor_id=$(echo "$window_json" | jq -r '.monitor')
+workspace_id=$(echo "$window_json" | jq -r '.workspace.id')
 
 if [[ "$window_addr" == "null" || -z "$window_addr" ]]; then
     echo "No focused window"
     exit 1
 fi
 
-hyprctl dispatch swapwindow "$direction"
+wx2=$((window_x + window_w))
+wy2=$((window_y + window_h))
 
-window_json_after=$(hyprctl activewindow -j)
-window_x_after=$(echo "$window_json_after" | jq -r '.at[0]')
-window_y_after=$(echo "$window_json_after" | jq -r '.at[1]')
-monitor_after=$(echo "$window_json_after" | jq -r '.monitor')
+# Check if there's an adjacent window in the given direction within the same workspace.
+# Uses axis-overlap so only geometrically adjacent windows count.
+case "$direction" in
+    l) adj_filter="(.at[0] + .size[0]) <= $window_x and .at[1] < $wy2 and (.at[1] + .size[1]) > $window_y" ;;
+    r) adj_filter=".at[0] >= $wx2 and .at[1] < $wy2 and (.at[1] + .size[1]) > $window_y" ;;
+    u) adj_filter="(.at[1] + .size[1]) <= $window_y and .at[0] < $wx2 and (.at[0] + .size[0]) > $window_x" ;;
+    d) adj_filter=".at[1] >= $wy2 and .at[0] < $wx2 and (.at[0] + .size[0]) > $window_x" ;;
+esac
 
-# If position changed but stayed on same monitor, swap happened within workspace - done
-if [[ "$window_x" != "$window_x_after" || "$window_y" != "$window_y_after" ]]; then
-    if [[ "$monitor_after" == "$current_monitor_id" ]]; then
-        exit 0
-    fi
-    # swapwindow crossed a monitor - undo it, then fall through to movetoworkspace
-    case "$direction" in
-        r) hyprctl dispatch swapwindow l ;;
-        l) hyprctl dispatch swapwindow r ;;
-        d) hyprctl dispatch swapwindow u ;;
-        u) hyprctl dispatch swapwindow d ;;
-    esac
+adjacent=$(hyprctl clients -j | jq --argjson ws "$workspace_id" --arg addr "$window_addr" \
+    "[.[] | select(.workspace.id == \$ws and .address != \$addr and ($adj_filter))] | length")
+
+if [[ "$adjacent" -gt 0 ]]; then
+    hyprctl dispatch swapwindow "$direction"
+    exit 0
 fi
 
-
+# No adjacent window in this direction - find adjacent monitor and move there
 monitors_json=$(hyprctl monitors -j)
 
 # Compute current monitor's actual bounds (swap w/h for 90°/270° rotation)
